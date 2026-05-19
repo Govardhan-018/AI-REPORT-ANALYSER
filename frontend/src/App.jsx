@@ -3,6 +3,7 @@ import './App.css'
 import DocumentPanel from './panels/DocumentPanel'
 import ChatPanel from './panels/ChatPanel'
 import EvidencePanel from './panels/EvidencePanel'
+import QuestionnairePanel from './panels/QuestionnairePanel'
 
 const API = 'http://localhost:8000'
 
@@ -11,8 +12,8 @@ function App() {
   const [documents, setDocuments] = useState([])
   const [evidence, setEvidence] = useState([])
   const [chatReady, setChatReady] = useState(false)
+  const [activeTab, setActiveTab] = useState('chat')
 
-  // Health check
   const checkHealth = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/health`)
@@ -23,15 +24,12 @@ function App() {
     }
   }, [])
 
-  // Load documents
   const loadDocuments = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/documents`)
       const data = await res.json()
       setDocuments(data.documents || [])
-    } catch {
-      // silently fail
-    }
+    } catch { }
   }, [])
 
   useEffect(() => {
@@ -41,7 +39,6 @@ function App() {
     return () => clearInterval(interval)
   }, [checkHealth, loadDocuments])
 
-  // Update chat readiness when documents change
   useEffect(() => {
     const hasReady = documents.some(
       d => d.status === 'ready' || (d.chunk_count > 0 && d.status !== 'error')
@@ -70,6 +67,29 @@ function App() {
             <p className="text-[11px] text-neutral-400 font-medium tracking-wide uppercase">Local Document Intelligence</p>
           </div>
         </div>
+
+        {/* Tab Navigation */}
+        <div className="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
+          <button
+            onClick={() => setActiveTab('chat')}
+            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${activeTab === 'chat' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'}`}
+          >
+            <span className="flex items-center gap-1.5">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              Chat
+            </span>
+          </button>
+          <button
+            onClick={() => setActiveTab('questionnaire')}
+            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${activeTab === 'questionnaire' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'}`}
+          >
+            <span className="flex items-center gap-1.5">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              Questionnaire
+            </span>
+          </button>
+        </div>
+
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-neutral-200 bg-neutral-50">
           <span className={`w-2 h-2 rounded-full ${allOnline ? 'bg-emerald-500' : 'bg-amber-500'}`} />
           <span className="text-xs font-medium text-neutral-600">
@@ -78,30 +98,28 @@ function App() {
         </div>
       </header>
 
-      {/* ═══ Three-Panel Layout ═══ */}
+      {/* ═══ Main Layout ═══ */}
       <div className="flex flex-1 min-h-0">
         {/* Left Panel — Documents */}
         <div className="w-[300px] shrink-0 border-r border-neutral-200 bg-white flex flex-col">
-          <DocumentPanel
-            documents={documents}
-            onDocumentsChange={loadDocuments}
-            apiBase={API}
-          />
+          <DocumentPanel documents={documents} onDocumentsChange={loadDocuments} apiBase={API} />
         </div>
 
-        {/* Center Panel — Chat */}
+        {/* Center Panel — Chat or Questionnaire */}
         <div className="flex-1 flex flex-col min-w-0 bg-[#fafafa]">
-          <ChatPanel
-            chatReady={chatReady}
-            onEvidenceUpdate={handleEvidenceUpdate}
-            apiBase={API}
-          />
+          {activeTab === 'chat' ? (
+            <ChatPanel chatReady={chatReady} onEvidenceUpdate={handleEvidenceUpdate} apiBase={API} />
+          ) : (
+            <QuestionnairePanel chatReady={chatReady} />
+          )}
         </div>
 
-        {/* Right Panel — Evidence */}
-        <div className="w-[340px] shrink-0 border-l border-neutral-200 bg-white flex flex-col">
-          <EvidencePanel evidence={evidence} />
-        </div>
+        {/* Right Panel — Evidence (only show for chat tab) */}
+        {activeTab === 'chat' && (
+          <div className="w-[340px] shrink-0 border-l border-neutral-200 bg-white flex flex-col">
+            <EvidencePanel evidence={evidence} />
+          </div>
+        )}
       </div>
 
       {/* ═══ Footer ═══ */}

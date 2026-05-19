@@ -26,14 +26,14 @@ class GroqClient:
 
     async def check_availability(self) -> bool:
         if not self._client:
-            logger.warning("Groq not available: GORQ_API not set")
+            logger.warning("Groq not available: GROQ_API_KEY not set")
             return False
         return True
 
     async def chat_stream(self, messages: List[dict], model: Optional[str] = None) -> AsyncGenerator[str, None]:
         model = model or self.chat_model
         if not self._client:
-            yield f"\n\n[Error: GORQ_API is not configured. Please set it in your .env file.]"
+            yield f"\n\n[Error: GROQ_API_KEY is not configured. Please set it in your .env file.]"
             return
             
         token_count = 0
@@ -57,7 +57,7 @@ class GroqClient:
     async def chat(self, messages: List[dict], model: Optional[str] = None) -> str:
         model = model or self.chat_model
         if not self._client:
-            return "[Error: GORQ_API is not configured. Please set it in your .env file.]"
+            return "[Error: GROQ_API_KEY is not configured. Please set it in your .env file.]"
             
         try:
             response = await self._client.chat.completions.create(

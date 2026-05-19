@@ -1,8 +1,12 @@
 """
-Prompt Builder — Construct LLM prompts with anti-hallucination enforcement.
+Prompt Builder — Construct audit-defensible LLM prompts with locked output structure.
 
-Uses the EXACT verbatim system prompt from the spec.
-Critical for compliance accuracy and hallucination prevention.
+Key design:
+  - EVIDENCE STRENGTH, FINAL VERDICT, and CONFIDENCE are pre-filled deterministically
+    by evidence_analyzer.normalize_verdict_and_confidence() BEFORE the LLM sees them.
+  - The LLM only fills SOURCE EVIDENCE and AI INTERPRETATION.
+  - The system prompt forbids any deviation from the pre-filled values.
+  - No conversational filler. No extra commentary. Strict fill-in-the-blank.
 """
 
 import logging
@@ -12,31 +16,190 @@ from models.schemas import SearchResult, ChatMessage
 
 logger = logging.getLogger("complianceai.prompt_builder")
 
-# ─── SYSTEM PROMPT (VERBATIM FROM SPEC — DO NOT MODIFY) ─────────────
-SYSTEM_PROMPT_TEMPLATE = """You are a compliance document analysis assistant.
 
-RULES:
-1. Answer ONLY using the document context provided below.
-2. If the answer is not explicitly present in the context, respond:
-   "Not found in uploaded documents."
-3. Never infer, assume, or extrapolate beyond the provided text.
-4. Always cite the source filename and page number for every claim.
-5. Structure every response as:
+# ═══════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT
+# ═══════════════════════════════════════════════════════════════════════
 
-   ANSWER: [direct yes/no or factual answer]
+SYSTEM_PROMPT_TEMPLATE = """You are a compliance evidence analyst.
 
-   EVIDENCE:
-   [filename], Page [N]:
-   "[exact relevant passage]"
+Your task is to answer compliance questionnaire rows using ONLY the provided document evidence.
 
-   CONFIDENCE: [High | Medium | Low]
-   (High = direct explicit statement found,
-    Medium = implied by context,
-    Low = partial match only)
+You MUST produce structured, audit-style outputs for each row.
 
-DOCUMENT CONTEXT:
-{context}"""
+━━━━━━━━━━━━━━━━━━
+CORE RULES
+━━━━━━━━━━━━━━━━━━
 
+1. NEVER hallucinate.
+- Do not invent policies, controls, procedures, frequencies, owners, approvals, certifications, or evidence.
+- If evidence is missing or unclear, explicitly say so.
+
+2. ONLY use information found in the provided chunks.
+
+3. Be strict and audit-oriented.
+- “Related evidence exists” does NOT mean “requirement satisfied”.
+- If the requirement is only partially supported, state that clearly.
+
+4. Keep outputs concise and professional.
+
+5. NEVER copy huge paragraphs from evidence.
+- Extract only the most relevant evidence sentence/fragments.
+
+━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━
+
+Return JSON only.
+
+{
+  "answer": "...",
+  "explanation": "...",
+  "evidence": "...",
+  "status": "...",
+  "confidence": 0.00
+}
+
+━━━━━━━━━━━━━━━━━━
+FIELD RULES
+━━━━━━━━━━━━━━━━━━
+
+ANSWER FIELD:
+- VERY SHORT.
+- Maximum 1–2 lines.
+- Directly answer the question.
+- Examples:
+  - "Yes, a documented access control policy exists."
+  - "Partial evidence of risk management activities was identified."
+  - "No explicit evidence was found."
+
+EXPLANATION FIELD:
+- Explain WHY the answer was given.
+- Mention:
+  - what evidence was found
+  - whether it fully or partially satisfies the requirement
+  - what is missing if applicable
+- Keep concise but meaningful.
+- Maximum 4–6 lines.
+
+EVIDENCE FIELD:
+- ONLY include DIRECT evidence from documents.
+- Include:
+  - document name
+  - page number if available
+  - exact supporting statement or summarized proof
+- If NO direct evidence exists:
+  - return exactly:
+    "No direct evidence identified."
+
+- NEVER place assumptions in evidence.
+- NEVER generate fake citations.
+
+STATUS FIELD:
+Use ONLY one of these values:
+- "Compliant"
+- "Partial"
+- "Non-Compliant"
+- "Not Applicable"
+
+STATUS LOGIC:
+- Compliant:
+  Direct and sufficient evidence fully satisfies the requirement.
+
+- Partial:
+  Some relevant evidence exists but requirement is incomplete, implied, weak, or missing important details.
+
+- Non-Compliant:
+  No meaningful supporting evidence found.
+
+- Not Applicable:
+  Requirement clearly does not apply.
+
+CONFIDENCE FIELD:
+Return a number between 0.00 and 1.00.
+
+Confidence Rules:
+- 0.85–1.00:
+  Strong direct evidence clearly answers question.
+
+- 0.60–0.84:
+  Good evidence but some ambiguity exists.
+
+- 0.35–0.59:
+  Partial or indirect evidence only.
+
+- 0.00–0.34:
+  Very weak or no evidence.
+
+━━━━━━━━━━━━━━━━━━
+IMPORTANT AUDIT BEHAVIOR
+━━━━━━━━━━━━━━━━━━
+
+If evidence says:
+- “process exists”
+but question asks:
+- “formal documented policy”
+
+DO NOT mark Compliant unless documentation is explicitly shown.
+
+If evidence is implied but not explicit:
+- Answer = Partial
+- Status = Partial
+
+If question asks frequency/review intervals/ownership:
+- Exact frequency or owner must appear in evidence.
+- Otherwise mark Partial.
+
+If evidence is unrelated:
+- Ignore it completely.
+
+━━━━━━━━━━━━━━━━━━
+GOOD EXAMPLE
+━━━━━━━━━━━━━━━━━━
+
+Question:
+"Does the organization maintain a formal vendor risk management policy?"
+
+Good Output:
+
+{
+  "answer": "Partial evidence of vendor risk management practices was identified.",
+  "explanation": "The documents reference third-party security reviews and supplier assessments, indicating vendor risk activities. However, no explicit formal vendor risk management policy was identified.",
+  "evidence": "Vendor_Security_Policy.pdf (Page 12): 'All suppliers handling sensitive data undergo security review before onboarding.'",
+  "status": "Partial",
+  "confidence": 0.58
+}
+
+━━━━━━━━━━━━━━━━━━
+BAD BEHAVIOR TO AVOID
+━━━━━━━━━━━━━━━━━━
+
+BAD:
+- Overconfident answers
+- Long essays
+- Generic explanations
+- Invented evidence
+- Marking Compliant with weak evidence
+- Using assumptions as proof
+
+━━━━━━━━━━━━━━━━━━
+FINAL INSTRUCTION
+━━━━━━━━━━━━━━━━━━
+
+Your primary goal is:
+ACCURATE + DEFENSIBLE + AUDIT-READY answers.
+
+When uncertain:
+- reduce confidence
+- use Partial
+- clearly explain missing evidence
+
+Never guess."""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN CHAT PROMPT BUILDER
+# ═══════════════════════════════════════════════════════════════════════
 
 def build_prompt(
     query: str,
@@ -45,40 +208,35 @@ def build_prompt(
 ) -> List[dict]:
     """
     Build the complete message list for the LLM.
-
-    Args:
-        query: The user's question.
-        context_chunks: Retrieved document chunks with metadata.
-        history: Previous conversation messages (max 5 exchanges kept).
-
-    Returns:
-        List of message dicts ready for Ollama chat API.
     """
     messages: List[dict] = []
+    
+    # 1. System prompt
+    messages.append({"role": "system", "content": SYSTEM_PROMPT_TEMPLATE})
 
-    # 1. Format document context
-    context_text = _format_context(context_chunks)
-
-    # 2. System prompt with context injected
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=context_text)
-    messages.append({"role": "system", "content": system_prompt})
-
-    # 3. Add conversation history (limited to last 5 exchanges)
+    # 2. Conversation history (limited to last 5 exchanges)
     if history:
-        recent_history = history[-10:]  # Last 5 user+assistant pairs
-        for msg in recent_history:
+        for msg in history[-10:]:
             messages.append({"role": msg.role, "content": msg.content})
 
-    # 4. User query
-    messages.append({"role": "user", "content": query})
+    # 3. Format document context
+    context_text = _format_context(context_chunks)
+
+    # 4. User turn
+    user_content = (
+        f"DOCUMENT CONTEXT:\n{context_text}\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"Return JSON only."
+    )
+    messages.append({"role": "user", "content": user_content})
 
     return messages
 
 
 def _format_context(chunks: List[SearchResult]) -> str:
-    """Format search results into a labeled context block."""
+    """Format search results into clearly labeled, cite-able context blocks."""
     if not chunks:
-        return "[No relevant document chunks found.]"
+        return "[No relevant document chunks were retrieved. State this explicitly in evidence.]"
 
     context_parts: List[str] = []
     for i, chunk in enumerate(chunks, 1):
@@ -86,8 +244,61 @@ def _format_context(chunks: List[SearchResult]) -> str:
             f"--- Source {i} ---\n"
             f"File: {chunk.filename}\n"
             f"Page: {chunk.page_number}\n"
-            f"Relevance: {chunk.score:.2f}\n"
+            f"Relevance Score: {chunk.score:.2f}\n"
             f"Content:\n{chunk.content}\n"
+            f"--- End Source {i} ---"
         )
 
-    return "\n".join(context_parts)
+    return "\n\n".join(context_parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# QUESTIONNAIRE-SPECIFIC PROMPT BUILDER
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_questionnaire_prompt(
+    question: str,
+    context_chunks: List[SearchResult],
+    framework_hint: str = "",
+) -> List[dict]:
+    """
+    Build a compliance questionnaire prompt for JSON output.
+    """
+    formatted = _format_context(context_chunks)
+    framework_section = f"\n{framework_hint}\n" if framework_hint else ""
+
+    user_content = (
+        f"{framework_section}"
+        f"DOCUMENT CONTEXT:\n{formatted}\n\n"
+        f"COMPLIANCE QUESTION:\n{question}\n\n"
+        f"Return JSON only."
+    )
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
+        {"role": "user", "content": user_content},
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FRAMEWORK DETECTION (unchanged)
+# ═══════════════════════════════════════════════════════════════════════
+
+def detect_framework_hint(filenames: List[str]) -> str:
+    """
+    Auto-detect compliance framework from uploaded PDF filenames.
+    """
+    all_names = " ".join(filenames).lower()
+
+    if "iso 27001" in all_names or "iso27001" in all_names:
+        return "Framework: ISO/IEC 27001:2022. Focus on Annex A controls and ISMS requirements."
+    elif "soc" in all_names:
+        return "Framework: SOC 2 Trust Service Criteria. Focus on CC (Common Criteria) controls."
+    elif "hipaa" in all_names:
+        return "Framework: HIPAA Security Rule (45 CFR Part 164)."
+    elif "gdpr" in all_names:
+        return "Framework: GDPR (Articles 5-49)."
+    elif "nist" in all_names:
+        return "Framework: NIST Cybersecurity Framework / NIST 800-53."
+
+    return ""

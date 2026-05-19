@@ -8,6 +8,7 @@ Bound to 127.0.0.1 only — never 0.0.0.0.
 
 import sys
 import os
+import asyncio
 
 # Force UTF-8 output on Windows
 if sys.platform == "win32":
@@ -23,6 +24,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes.upload import router as upload_router
 from routes.chat import router as chat_router
 from routes.documents import router as documents_router
+from routes.questionnaire import router as questionnaire_router
+from routes.questionnaire import cleanup_old_questionnaires, periodic_cleanup
 from services.vector_store import VectorStoreService
 from services.ollama_client import OllamaClient
 from services.openrouter_client import OpenRouterClient
@@ -41,9 +44,11 @@ BASE_DIR = os.path.dirname(__file__)
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 UPLOADS_DIR = os.path.join(STORAGE_DIR, "uploads")
 CHROMA_DIR = os.path.join(STORAGE_DIR, "chroma_db")
+QUESTIONNAIRE_DIR = os.path.join(STORAGE_DIR, "questionnaires")
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
+os.makedirs(QUESTIONNAIRE_DIR, exist_ok=True)
 
 
 @asynccontextmanager
@@ -81,21 +86,32 @@ async def lifespan(app: FastAPI):
         logger.warning("OpenRouter is not available — OPENROUTER_API_KEY not set")
 
     # Initialize Groq Client
-    groq_api_key = os.getenv("GORQ_API", "")
+    groq_api_key = os.getenv("GROQ_API_KEY", "")
     groq_client = GroqClient(api_key=groq_api_key)
     app.state.groq_client = groq_client
     if groq_api_key:
         logger.info("Groq is available")
     else:
-        logger.warning("Groq is not available — GORQ_API not set")
+        logger.warning("Groq is not available — GROQ_API_KEY not set")
 
     # Store paths in app state
     app.state.uploads_dir = UPLOADS_DIR
     app.state.chroma_dir = CHROMA_DIR
     app.state.processing_status = {}
 
+    # Questionnaire state
+    app.state.questionnaire_registry = {}
+    app.state.download_tokens = {}
+
+    # Run initial cleanup and start periodic cleanup task
+    await cleanup_old_questionnaires()
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+
     logger.info("ComplianceAI backend ready on http://127.0.0.1:8000")
     yield
+
+    # Cancel cleanup on shutdown
+    cleanup_task.cancel()
     logger.info("Shutting down ComplianceAI backend...")
 
 
@@ -125,6 +141,7 @@ app.add_middleware(
 app.include_router(upload_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
+app.include_router(questionnaire_router, prefix="/questionnaire")
 
 
 @app.get("/api/health", response_model=HealthResponse)
@@ -158,6 +175,8 @@ async def get_models():
     ollama_client: OllamaClient = app.state.ollama_client
     ollama_ok = await ollama_client.check_availability()
     ollama_models = await ollama_client.list_models() if ollama_ok else []
+    # Filter out embedding models (like nomic-embed-text)
+    ollama_models = [m for m in ollama_models if "embed" not in m.lower()]
     
     # We hardcode popular free Groq models
     groq_models = [

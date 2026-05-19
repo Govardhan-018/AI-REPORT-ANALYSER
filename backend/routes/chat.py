@@ -46,7 +46,7 @@ async def chat_stream(request: Request, chat_request: ChatRequest):
     if provider == "groq":
         llm_client = request.app.state.groq_client
         if not llm_client.api_key:
-            raise HTTPException(status_code=400, detail="GORQ_API is not configured in .env file.")
+            raise HTTPException(status_code=400, detail="GROQ_API_KEY is not configured in .env file.")
     elif provider == "openrouter":
         llm_client = request.app.state.openrouter_client
         if not llm_client.api_key:

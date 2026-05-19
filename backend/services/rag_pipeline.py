@@ -1,8 +1,11 @@
 """
-RAG Pipeline — Retrieval-Augmented Generation orchestrator.
+RAG Pipeline — Retrieval-Augmented Generation orchestrator with evidence analysis.
 
-Coordinates: query embedding -> vector search -> prompt building -> LLM inference.
-Supports both streaming (SSE) and synchronous response modes.
+Flow:
+  Query → Embedding → Vector Search → Evidence Analysis → Prompt Building → LLM Inference
+
+The evidence analysis layer classifies retrieved chunks BEFORE they reach the LLM,
+ensuring audit-defensible responses with proper grounding.
 """
 
 import json
@@ -14,6 +17,8 @@ from models.schemas import SearchResult, ChatMessage, Evidence, ChatResponse
 from services.embeddings import embed_single
 from services.vector_store import VectorStoreService
 from services.prompt_builder import build_prompt
+from services.evidence_analyzer import analyze_evidence, format_evidence_analysis
+from services.compliance_intelligence import evaluate_compliance
 
 logger = logging.getLogger("complianceai.rag_pipeline")
 
@@ -33,10 +38,19 @@ class RAGPipeline:
         """
         Process a query and stream the response as SSE events.
 
+        Pipeline:
+          1. Embed query
+          2. Vector search
+          3. Evidence analysis (NEW — classify, grade, detect gaps)
+          4. Send evidence + analysis to frontend
+          5. Build constrained auditor prompt
+          6. Stream LLM response
+          7. Assess confidence and send completion
+
         Yields SSE-formatted event dicts:
-          - event: evidence  (with retrieved chunks)
+          - event: evidence  (with retrieved chunks + evidence analysis)
           - event: token     (streaming answer tokens)
-          - event: done      (final metadata)
+          - event: done      (final metadata including evidence strength)
         """
         history = history or []
 
@@ -67,18 +81,52 @@ class RAGPipeline:
         relevant_chunks = [r for r in search_results if r.score >= MIN_RELEVANCE_SCORE]
         logger.info("Retrieved %d relevant chunks (from %d total, threshold=%.2f)", len(relevant_chunks), len(search_results), MIN_RELEVANCE_SCORE)
 
-        # Step 3: Send evidence to frontend
-        evidence_data = [
-            {"filename": c.filename, "page_number": c.page_number, "content": c.content, "relevance_score": c.score}
-            for c in relevant_chunks
-        ]
-        yield self._sse_event("evidence", {"evidence": evidence_data})
+        # Step 3: Analyze evidence quality (NEW)
+        logger.info("Step 3: Analyzing evidence quality")
+        evidence_analysis = analyze_evidence(query=query, chunks=relevant_chunks)
+        evidence_analysis_text = format_evidence_analysis(evidence_analysis)
 
-        # Step 4: Build prompt
-        messages = build_prompt(query=query, context_chunks=relevant_chunks, history=history)
+        # Step 4: Send evidence + analysis to frontend
+        evidence_data = []
+        for i, chunk in enumerate(relevant_chunks):
+            classification = None
+            if i < len(evidence_analysis.classifications):
+                classification = evidence_analysis.classifications[i]
 
-        # Step 5: Stream LLM response
-        logger.info("Step 5: Streaming LLM response")
+            evidence_data.append({
+                "filename": chunk.filename,
+                "page_number": chunk.page_number,
+                "content": chunk.content,
+                "relevance_score": chunk.score,
+                "evidence_strength": classification.strength if classification else "",
+                "maturity_signals": classification.maturity_signals if classification else [],
+            })
+
+        yield self._sse_event("evidence", {
+            "evidence": evidence_data,
+            "evidence_analysis": {
+                "overall_strength": evidence_analysis.overall_strength,
+                "maturity_assessment": evidence_analysis.maturity_assessment,
+                "coverage_gaps": evidence_analysis.coverage_gaps,
+            },
+        })
+
+        # Step 5: Compute deterministic verdict + confidence BEFORE building prompt
+        # Use new Intelligence Layer
+        intel = evaluate_compliance(query, relevant_chunks)
+        verdict = intel["verdict"]
+        confidence = intel["confidence"]
+
+        # Step 7: Build audit-constrained prompt
+        logger.info("Step 7: Building audit-constrained prompt for JSON")
+        messages = build_prompt(
+            query=query,
+            context_chunks=relevant_chunks,
+            history=history,
+        )
+
+        # Step 6: Stream LLM response
+        logger.info("Step 6: Streaming LLM response")
         full_response = ""
         token_count = 0
         try:
@@ -92,12 +140,47 @@ class RAGPipeline:
             yield self._sse_event("error", {"message": f"LLM inference failed: {str(e)}"})
             return
 
-        # Step 6: Determine confidence
-        confidence = self._assess_confidence(full_response, relevant_chunks)
+        # Parse JSON from response
+        import re
+        json_str = full_response
+        match = re.search(r'\{.*\}', full_response, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            
+        parsed_json = {
+            "answer": full_response,
+            "status": "No Evidence",
+            "confidence": 0.0,
+            "explanation": "",
+        }
+        try:
+            parsed_json = json.loads(json_str)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse JSON in query_stream")
 
-        # Step 7: Send completion event
-        yield self._sse_event("done", {"answer": full_response, "confidence": confidence})
-        logger.info("Query processing completed. Confidence: %s", confidence)
+        answer_text = parsed_json.get("answer", "")
+        if parsed_json.get("explanation"):
+            answer_text += f"\n\nExplanation: {parsed_json['explanation']}"
+
+        yield self._sse_event("done", {
+            "answer": answer_text,
+            "confidence": str(parsed_json.get("confidence", 0.0)),
+            "evidence_strength": intel["evidence_classification"],
+            "verdict": parsed_json.get("status", "No Evidence"),
+            "coverage_gaps": evidence_analysis.coverage_gaps,
+            "requirement_attributes": intel["requirement_attributes"],
+            "proven_attributes": intel["proven_attributes"],
+            "missing_attributes": intel["missing_attributes"],
+            "gap_analysis": intel["gap_analysis"],
+            "audit_defensibility": intel["audit_defensibility"],
+            "evidence_sufficiency": intel["evidence_sufficiency"],
+            "compliance_risk": intel["compliance_risk"],
+            "reasoning": intel["reasoning"],
+        })
+        logger.info(
+            "Query completed. verdict=%s, confidence=%s, evidence_strength=%s",
+            verdict, confidence, evidence_analysis.overall_strength,
+        )
 
     async def query_sync(self, query: str, history: List[ChatMessage] = None) -> ChatResponse:
         """Process a query and return complete response (non-streaming)."""
@@ -105,32 +188,75 @@ class RAGPipeline:
         query_embedding = embed_single(query)
         search_results = self.vector_store.search(query_embedding=query_embedding, top_k=self.top_k)
         relevant_chunks = [r for r in search_results if r.score >= MIN_RELEVANCE_SCORE]
-        messages = build_prompt(query=query, context_chunks=relevant_chunks, history=history)
-        answer = await self.llm_client.chat(messages)
-        confidence = self._assess_confidence(answer, relevant_chunks)
-        evidence = [
-            Evidence(filename=c.filename, page_number=c.page_number, content=c.content, relevance_score=c.score)
-            for c in relevant_chunks
-        ]
-        return ChatResponse(answer=answer, evidence=evidence, confidence=confidence)
 
-    def _assess_confidence(self, answer: str, chunks: List[SearchResult]) -> str:
-        """Assess confidence level based on retrieval quality and answer content."""
-        not_found_phrases = ["not found in uploaded documents", "not explicitly found", "no relevant information"]
-        answer_lower = answer.lower()
-        for phrase in not_found_phrases:
-            if phrase in answer_lower:
-                return "Low"
-        if not chunks:
-            return "Low"
-        top_score = max(c.score for c in chunks) if chunks else 0
-        if top_score >= 0.7:
-            return "High"
-        elif top_score >= 0.4:
-            return "Medium"
-        else:
-            return "Low"
+        # Evidence analysis
+        evidence_analysis = analyze_evidence(query=query, chunks=relevant_chunks)
+        evidence_analysis_text = format_evidence_analysis(evidence_analysis)
+
+        # Deterministic verdict + confidence from intelligence layer
+        intel = evaluate_compliance(query, relevant_chunks)
+        verdict = intel["verdict"]
+        confidence = intel["confidence"]
+
+        messages = build_prompt(
+            query=query,
+            context_chunks=relevant_chunks,
+            history=history,
+        )
+        answer_raw = await self.llm_client.chat(messages)
+
+        import re
+        json_str = answer_raw
+        match = re.search(r'\{.*\}', answer_raw, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            
+        parsed_json = {
+            "answer": answer_raw,
+            "status": "No Evidence",
+            "confidence": 0.0,
+            "explanation": ""
+        }
+        try:
+            parsed_json = json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+
+        answer_text = parsed_json.get("answer", "")
+        if parsed_json.get("explanation"):
+            answer_text += f"\n\nExplanation: {parsed_json['explanation']}"
+
+        # Build enriched evidence list
+        evidence = []
+        for i, c in enumerate(relevant_chunks):
+            classification = evidence_analysis.classifications[i] if i < len(evidence_analysis.classifications) else None
+            evidence.append(Evidence(
+                filename=c.filename,
+                page_number=c.page_number,
+                content=c.content,
+                relevance_score=c.score,
+                evidence_strength=classification.strength if classification else "",
+                maturity_signals=classification.maturity_signals if classification else [],
+            ))
+
+        return ChatResponse(
+            answer=answer_text,
+            evidence=evidence,
+            confidence=str(parsed_json.get("confidence", 0.0)),
+            evidence_strength=intel["evidence_classification"],
+            verdict=parsed_json.get("status", "No Evidence"),
+            coverage_gaps=evidence_analysis.coverage_gaps,
+            requirement_attributes=intel["requirement_attributes"],
+            proven_attributes=intel["proven_attributes"],
+            missing_attributes=intel["missing_attributes"],
+            gap_analysis=intel["gap_analysis"],
+            audit_defensibility=intel["audit_defensibility"],
+            evidence_sufficiency=intel["evidence_sufficiency"],
+            compliance_risk=intel["compliance_risk"],
+            reasoning=intel["reasoning"],
+        )
 
     @staticmethod
     def _sse_event(event_type: str, data: dict) -> dict:
         return {"event": event_type, "data": json.dumps(data)}
+
