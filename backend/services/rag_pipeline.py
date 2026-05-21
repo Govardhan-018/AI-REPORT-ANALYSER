@@ -1,16 +1,21 @@
 """
-RAG Pipeline — Retrieval-Augmented Generation orchestrator with evidence analysis.
+RAG Pipeline - Retrieval-Augmented Generation orchestrator with evidence analysis.
 
 Flow:
-  Query → Embedding → Vector Search → Evidence Analysis → Prompt Building → LLM Inference
+  Query -> Embedding -> Vector Search -> Evidence Analysis -> Prompt Building -> LLM Inference
 
 The evidence analysis layer classifies retrieved chunks BEFORE they reach the LLM,
 ensuring audit-defensible responses with proper grounding.
+
+FIX 4: Temporal evidence prioritization - chunks containing temporal keywords
+       (annually, quarterly, monthly, etc.) are moved to the top of the context
+       window so the LLM sees schedule/frequency evidence first.
 """
 
 import json
 import logging
 import asyncio
+import re
 from typing import List, AsyncGenerator
 
 from models.schemas import SearchResult, ChatMessage, Evidence, ChatResponse
@@ -22,8 +27,65 @@ from services.compliance_intelligence import evaluate_compliance
 
 logger = logging.getLogger("complianceai.rag_pipeline")
 
-DEFAULT_TOP_K = 5
-MIN_RELEVANCE_SCORE = 0.50  # Lowered from 0.65. nomic-embed-text typical cosine similarities range 0.5-0.6 for relevant matches
+# FIX 2/4: Increased from 5 to 10 to match vector_store default
+DEFAULT_TOP_K = 10
+MIN_RELEVANCE_SCORE = 0.50  # nomic-embed-text typical cosine similarities range 0.5-0.6 for relevant matches
+
+# FIX 4: Temporal keywords used to prioritize chunks in the context window
+TEMPORAL_KEYWORDS = [
+    "annually", "annual", "quarterly", "monthly", "periodic",
+    "planned interval", "at least once", "at least",
+    "semi-annual", "biannual", "weekly", "daily",
+]
+# Compile a single regex pattern for efficient matching
+_TEMPORAL_PATTERN = re.compile(
+    r'\b(?:' + '|'.join(re.escape(kw) for kw in TEMPORAL_KEYWORDS) + r')\b',
+    re.IGNORECASE
+)
+
+
+def extract_temporal_evidence(chunks: List[SearchResult]) -> List[SearchResult]:
+    """
+    FIX 4: Filter and return chunks that contain temporal keywords.
+
+    Used to identify chunks with schedule/frequency evidence so they can
+    be moved to the top of the context window before prompt building.
+
+    Args:
+        chunks: List of SearchResult objects from vector search.
+
+    Returns:
+        List of SearchResult objects that contain temporal keywords.
+    """
+    temporal_chunks = []
+    for chunk in chunks:
+        if _TEMPORAL_PATTERN.search(chunk.content):
+            temporal_chunks.append(chunk)
+    return temporal_chunks
+
+
+def _reorder_chunks_temporal_first(chunks: List[SearchResult]) -> List[SearchResult]:
+    """
+    FIX 4: Reorder chunks so that temporal-keyword chunks appear first,
+    followed by remaining chunks in their original relevance order.
+    No duplicates - each chunk appears exactly once.
+    """
+    temporal = []
+    non_temporal = []
+
+    for chunk in chunks:
+        if _TEMPORAL_PATTERN.search(chunk.content):
+            temporal.append(chunk)
+        else:
+            non_temporal.append(chunk)
+
+    if temporal:
+        logger.info(
+            "FIX 4: Moved %d temporal-evidence chunks to top of context window",
+            len(temporal)
+        )
+
+    return temporal + non_temporal
 
 
 class RAGPipeline:
@@ -80,6 +142,9 @@ class RAGPipeline:
         # Filter by minimum relevance
         relevant_chunks = [r for r in search_results if r.score >= MIN_RELEVANCE_SCORE]
         logger.info("Retrieved %d relevant chunks (from %d total, threshold=%.2f)", len(relevant_chunks), len(search_results), MIN_RELEVANCE_SCORE)
+
+        # FIX 4: Reorder chunks so temporal-keyword chunks appear first
+        relevant_chunks = _reorder_chunks_temporal_first(relevant_chunks)
 
         # Step 3: Analyze evidence quality (NEW)
         logger.info("Step 3: Analyzing evidence quality")
@@ -188,6 +253,8 @@ class RAGPipeline:
         query_embedding = embed_single(query)
         search_results = self.vector_store.search(query_embedding=query_embedding, top_k=self.top_k)
         relevant_chunks = [r for r in search_results if r.score >= MIN_RELEVANCE_SCORE]
+        # FIX 4: Reorder - temporal chunks first in sync path too
+        relevant_chunks = _reorder_chunks_temporal_first(relevant_chunks)
 
         # Evidence analysis
         evidence_analysis = analyze_evidence(query=query, chunks=relevant_chunks)

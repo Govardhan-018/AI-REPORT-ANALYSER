@@ -110,7 +110,7 @@ class VectorStoreService:
     def search(
         self,
         query_embedding: List[float],
-        top_k: int = 5,
+        top_k: int = 10,  # FIX 2: Increased from 5 to 10 — SOC 2 answers span 6+ chunks
         filename_filter: Optional[str] = None,
     ) -> List[SearchResult]:
         """

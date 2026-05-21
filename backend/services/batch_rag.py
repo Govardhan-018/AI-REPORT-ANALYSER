@@ -6,6 +6,13 @@ Handles:
   - Configurable concurrency (default: 1 to avoid Ollama overload)
   - Per-question timeout with graceful error handling
   - Confidence scoring and compliance status determination
+
+FIX 5: Query expansion for questionnaire processing.
+  - Generates 2 additional search queries per question using heuristic rules
+  - Frequency questions -> "annual schedule" + "review interval" variants
+  - Policy questions -> "<subject> policy procedure" + "<subject> documented"
+  - All questions -> shortened 5-7 word version (ISO tag stripped)
+  - Retrieves chunks for all expanded queries, deduplicates, merges top-10
 """
 
 import os
@@ -15,7 +22,7 @@ import re
 from typing import List, Dict, Callable, Optional
 
 from models.schemas import QuestionRow, AnswerResult, SearchResult
-from services.rag_pipeline import RAGPipeline, MIN_RELEVANCE_SCORE
+from services.rag_pipeline import RAGPipeline, MIN_RELEVANCE_SCORE, _reorder_chunks_temporal_first
 from services.prompt_builder import build_questionnaire_prompt, detect_framework_hint, _format_context
 from services.embeddings import embed_single
 from services.vector_store import VectorStoreService
@@ -25,6 +32,10 @@ logger = logging.getLogger("complianceai.batch_rag")
 # Configurable via environment variables
 BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "1"))
 QUESTION_TIMEOUT = int(os.getenv("QUESTION_TIMEOUT", "60"))
+
+# FIX 5: Maximum number of unique chunks to pass after query expansion merge
+MAX_MERGED_CHUNKS = 10
+
 
 def clean_duplicate_blocks(text: str) -> str:
     """Remove duplicate block sections from LLM output."""
@@ -43,6 +54,182 @@ def clean_duplicate_blocks(text: str) -> str:
     return text
 
 
+# =====================================================================
+# FIX 5: QUERY EXPANSION HELPERS
+# =====================================================================
+
+def _strip_iso_tag(question: str) -> str:
+    """
+    FIX 5: Remove ISO/framework tag prefixes like '[ISO 27001]', '[SOC 2]',
+    '[HIPAA]' from the beginning of a question.
+    """
+    return re.sub(r'^\s*\[.*?\]\s*', '', question).strip()
+
+
+def _shorten_query(question: str, max_words: int = 7) -> str:
+    """
+    FIX 5: Create a shortened 5-7 word search query from a question.
+    Strips ISO tags, removes filler words, keeps core subject.
+    """
+    clean = _strip_iso_tag(question)
+    # Remove common question prefixes
+    clean = re.sub(
+        r'^(?:does the organization|is there a|are there|do you have|'
+        r'how often does|how frequently|does the company|'
+        r'is the organization|has the organization)\s+',
+        '', clean, flags=re.IGNORECASE
+    )
+    words = clean.split()
+    return ' '.join(words[:max_words])
+
+
+def _extract_subject_noun(question: str) -> str:
+    """
+    FIX 5: Extract the core subject noun phrase from a policy/procedure question.
+    E.g., "Does the policy include data retention?" -> "data retention"
+    """
+    clean = _strip_iso_tag(question)
+    # Try to find the subject after common verbs
+    patterns = [
+        r'(?:include|cover|address|define|establish|describe)\s+(.+?)(?:\?|$)',
+        r'(?:policy for|procedure for|process for)\s+(.+?)(?:\?|$)',
+        r'(?:is there a|does .+ have a?)\s+(.+?)(?:\s+policy|\s+procedure|\s+process)?(?:\?|$)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, clean, re.IGNORECASE)
+        if match:
+            subject = match.group(1).strip().rstrip('?.,;')
+            # Limit to reasonable length
+            words = subject.split()
+            return ' '.join(words[:5])
+    
+    # Fallback: return the shortened question
+    return _shorten_query(question, max_words=5)
+
+
+def expand_query(question: str) -> List[str]:
+    """
+    FIX 5: Generate additional search queries from a questionnaire question.
+
+    Heuristic expansion rules:
+    - Frequency questions ("how often", "frequency", "how frequently"):
+        -> replace trigger phrase with "annual schedule"
+        -> prepend "review interval" to core subject
+    - Policy questions ("does the policy include", "is there a policy"):
+        -> "<subject> policy procedure"
+        -> "<subject> documented"
+    - All questions: also search a shortened 5-7 word version (ISO tag stripped)
+
+    Args:
+        question: The original questionnaire question text.
+
+    Returns:
+        List of expanded query strings (does NOT include the original question).
+    """
+    expanded = []
+    question_lower = question.lower()
+    clean_question = _strip_iso_tag(question)
+
+    # --- Rule 1: Frequency questions ---
+    frequency_triggers = ['how often', 'frequency', 'how frequently']
+    is_frequency = any(trigger in question_lower for trigger in frequency_triggers)
+
+    if is_frequency:
+        # Variant 1: Replace trigger phrase with "annual schedule"
+        variant1 = clean_question
+        for trigger in frequency_triggers:
+            variant1 = re.sub(re.escape(trigger), 'annual schedule', variant1, flags=re.IGNORECASE)
+        expanded.append(variant1)
+
+        # Variant 2: Prepend "review interval" to the core subject
+        subject = _shorten_query(question, max_words=5)
+        expanded.append(f"review interval {subject}")
+
+    # --- Rule 2: Policy questions ---
+    policy_triggers = ['does the policy include', 'is there a policy', 'does the organization have a policy']
+    is_policy = any(trigger in question_lower for trigger in policy_triggers)
+
+    if is_policy:
+        subject = _extract_subject_noun(question)
+        # Variant 1: "<subject> policy procedure"
+        expanded.append(f"{subject} policy procedure")
+        # Variant 2: "<subject> documented"
+        expanded.append(f"{subject} documented")
+
+    # --- Rule 3: All questions get a shortened variant (ISO tag stripped) ---
+    short = _shorten_query(question, max_words=7)
+    if short and short not in expanded:
+        expanded.append(short)
+
+    logger.debug("FIX 5: Expanded '%s' into %d additional queries: %s",
+                 question[:60], len(expanded), expanded)
+
+    return expanded
+
+
+async def _retrieve_with_expansion(
+    question_text: str,
+    vector_store: VectorStoreService,
+) -> List[SearchResult]:
+    """
+    FIX 5: Retrieve chunks using query expansion.
+
+    1. Embed the original question + all expanded queries
+    2. Retrieve chunks for each query
+    3. Merge results, deduplicate by chunk_id
+    4. Rank by best score, return top MAX_MERGED_CHUNKS unique chunks
+
+    Args:
+        question_text: The original question text.
+        vector_store: ChromaDB vector store service.
+
+    Returns:
+        List of top-10 unique SearchResult objects ranked by best score.
+    """
+    loop = asyncio.get_event_loop()
+
+    # Generate expanded queries
+    expanded_queries = expand_query(question_text)
+    all_queries = [question_text] + expanded_queries
+
+    logger.info("FIX 5: Searching with %d queries (1 original + %d expanded)",
+                len(all_queries), len(expanded_queries))
+
+    # Collect all results across all queries
+    # Key: chunk_id -> SearchResult (keep the one with the highest score)
+    best_by_chunk_id: Dict[str, SearchResult] = {}
+
+    for query in all_queries:
+        # Embed the query
+        query_embedding = await loop.run_in_executor(None, embed_single, query)
+
+        if not query_embedding or all(v == 0.0 for v in query_embedding):
+            logger.warning("FIX 5: Failed to embed expanded query: '%s'", query[:60])
+            continue
+
+        # FIX 2: Retrieve with n_results=10 for batch processing
+        search_results = vector_store.search(query_embedding=query_embedding, top_k=10)
+
+        # Merge: keep best score per chunk_id (deduplication)
+        for result in search_results:
+            existing = best_by_chunk_id.get(result.chunk_id)
+            if existing is None or result.score > existing.score:
+                best_by_chunk_id[result.chunk_id] = result
+
+    # Rank by best score, take top MAX_MERGED_CHUNKS
+    merged = sorted(best_by_chunk_id.values(), key=lambda r: r.score, reverse=True)
+    top_chunks = merged[:MAX_MERGED_CHUNKS]
+
+    logger.info("FIX 5: Merged %d unique chunks from %d queries, returning top %d",
+                len(merged), len(all_queries), len(top_chunks))
+
+    return top_chunks
+
+
+# =====================================================================
+# BATCH PROCESSING (updated to use query expansion)
+# =====================================================================
+
 async def process_questionnaire_batch(
     questions: List[QuestionRow],
     vector_store: VectorStoreService,
@@ -53,7 +240,7 @@ async def process_questionnaire_batch(
     Process a batch of questionnaire questions through the RAG pipeline.
 
     For each question:
-      1. Embed the question
+      1. Embed the question (with FIX 5 query expansion)
       2. Retrieve relevant chunks from ChromaDB
       3. Build a compliance-specific prompt
       4. Get LLM response
@@ -116,7 +303,7 @@ async def _process_single_question(
         return AnswerResult(
             row_index=question.row_index,
             question=question_text,
-            answer="(Skipped — empty question)",
+            answer="(Skipped -- empty question)",
             confidence_score=0.0,
             status="No Evidence",
         )
@@ -133,7 +320,7 @@ async def _process_single_question(
         return AnswerResult(
             row_index=question.row_index,
             question=question_text,
-            answer="Processing timeout — please retry this question manually",
+            answer="Processing timeout -- please retry this question manually",
             confidence_score=0.0,
             status="No Evidence",
         )
@@ -159,24 +346,38 @@ async def _rag_query(
     """
     Execute the RAG pipeline for a single question.
 
-    Steps: embed → search → prompt → LLM → score → result
+    Steps: expand -> embed -> search -> merge -> reorder -> prompt -> LLM -> score -> result
+
+    FIX 5: Uses query expansion to retrieve chunks across multiple search queries,
+           then deduplicates and ranks by best score before passing to the LLM.
+    FIX 4: Reorders merged chunks so temporal-keyword chunks appear first.
+    FIX 2: Retrieves top_k=10 chunks per query.
     """
-    # Step 1: Embed the question
-    loop = asyncio.get_event_loop()
-    query_embedding = await loop.run_in_executor(None, embed_single, question_text)
+    # FIX 5: Retrieve with query expansion (embed + search + merge + deduplicate)
+    all_chunks = await _retrieve_with_expansion(question_text, vector_store)
 
-    if not query_embedding or all(v == 0.0 for v in query_embedding):
-        return AnswerResult(
-            row_index=row_index,
-            question=question_text,
-            answer="Failed to generate query embedding. Check Ollama/nomic-embed-text.",
-            confidence_score=0.0,
-            status="No Evidence",
-        )
+    # Filter by minimum relevance score
+    relevant_chunks = [r for r in all_chunks if r.score >= MIN_RELEVANCE_SCORE]
 
-    # Step 2: Retrieve relevant chunks
-    search_results = vector_store.search(query_embedding=query_embedding, top_k=5)
-    relevant_chunks = [r for r in search_results if r.score >= MIN_RELEVANCE_SCORE]
+    # FIX 4: Reorder so temporal-keyword chunks appear first
+    relevant_chunks = _reorder_chunks_temporal_first(relevant_chunks)
+
+    # Handle case where expansion returned no embeddings at all
+    if not all_chunks:
+        # Fallback: try direct embedding without expansion
+        loop = asyncio.get_event_loop()
+        query_embedding = await loop.run_in_executor(None, embed_single, question_text)
+        if not query_embedding or all(v == 0.0 for v in query_embedding):
+            return AnswerResult(
+                row_index=row_index,
+                question=question_text,
+                answer="Failed to generate query embedding. Check Ollama/nomic-embed-text.",
+                confidence_score=0.0,
+                status="No Evidence",
+            )
+        search_results = vector_store.search(query_embedding=query_embedding, top_k=10)
+        relevant_chunks = [r for r in search_results if r.score >= MIN_RELEVANCE_SCORE]
+        relevant_chunks = _reorder_chunks_temporal_first(relevant_chunks)
 
     # Step 3: Analyze evidence quality (audit-defensible grounding)
     from services.compliance_intelligence import evaluate_compliance
